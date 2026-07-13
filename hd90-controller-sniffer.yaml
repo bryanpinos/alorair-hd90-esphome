@@ -1,0 +1,260 @@
+# =============================================================================
+#  hd90-controller-sniffer.yaml   --   PHASE 1: CAN SNIFFER
+#
+#  Diagnostic build for the AlorAir Sentinel HD90 controller.
+#  Goal: prove the CAN link works and DUMP every frame so the HD90's frame
+#  layout can be reverse-engineered before writing the production firmware.
+#
+#  Hardware:
+#    - Adafruit ESP32 Feather V2   (Product 5400)
+#    - Adafruit CAN Bus FeatherWing (Product 5709)  <- MCP2515 + TJA1051/3
+#
+#  Verified wiring (Feather V2 <-> CAN FeatherWing, via stacking headers):
+#    SPI SCK  = GPIO5   (Feather silk "SCK")
+#    SPI MOSI = GPIO19  (Feather silk "MO")
+#    SPI MISO = GPIO21  (Feather silk "MI")
+#    MCP2515 CS  = GPIO14  (wing's CS jumper -> classic Feather "pin 5"
+#                           position, which is GPIO14 on the V2)
+#    MCP2515 INT = GPIO32  (wing's INT jumper -> "pin 6" = GPIO32).
+#                           *** ESPHome's mcp2515 driver POLLS, so INT is not
+#                           used here -- leave it, it does no harm. ***
+#
+#  CAN FeatherWing screw terminal -> dehumidifier RJ45 (via 4511 adapter):
+#    Terminal "H"  -> RJ45 pin 5 (CAN-H)
+#    Terminal "L"  -> RJ45 pin 4 (CAN-L)
+#    Terminal "-"  -> RJ45 pin 8 (GND)
+#  (RJ45 pin 7 = 5V VCC is the OPTIONAL power tap -> Feather USB/5V pin.)
+# =============================================================================
+
+substitutions:
+  node_name: "hd90-controller"
+  friendly_name: "HD90 Dehumidifier (Sniffer)"
+
+  # --- CAN link tuning -------------------------------------------------------
+  # Community RE splits on the rate: tinymicros HD55 = 50 kbps, Nick's HD55S =
+  # 125 kbps. Try 50 first; if no response to the poll, reflash at 125KBPS.
+  can_bitrate: "125KBPS"
+  # The Adafruit CAN FeatherWing uses a 16 MHz crystal (Adafruit_MCP2515
+  # library default). If the log prints an "invalid clock/bitrate" warning at
+  # boot, this is the first thing to check.
+  mcp_clock: "16MHZ"
+
+  # --- Poll the unit (emulate the remote) ------------------------------------
+  # The HD90 is POLL-DRIVEN: silent until the remote asks. We send the remote's
+  # request frame and watch for the reply. Requires NORMAL mode (below) so we
+  # can transmit (and ACK the unit's response).
+  poll_on: "true"          # send the poll frame on a timer
+  poll_period: "1s"        # RE suggests <=60s; 1s while we're hunting
+  poll_id: "0x123"         # remote->unit request ID (agreed across both RE sources)
+
+  # --- Bench self-test vs. live sniffing (set can_mode for the situation) ---
+  #   LOOPBACK   -> BENCH TEST: the MCP2515 receives its own transmissions
+  #                 internally, so the self-test frame below echoes back through
+  #                 on_frame with NOTHING connected. Proves SPI + CS + clock +
+  #                 MCP2515 + TX/RX end to end.
+  #   LISTENONLY -> LIVE SNIFF: receive only, never transmits or ACKs (safe on a
+  #                 bus you don't understand yet). The controller ignores the
+  #                 self-test send in this mode, so it's a harmless no-op.
+  #   NORMAL     -> participate/ACK -- only once you trust the bus.
+  can_mode: "NORMAL"       # NORMAL so we can transmit the poll AND ACK the unit's
+                           # reply. As the only node this is required to get the
+                           # poll-driven HD90 to answer. (Was LISTENONLY.)
+  selftest_on: "false"     # true ONLY for the LOOPBACK bench test. Keeping this
+                           # false means the self-test never transmits, even in
+                           # NORMAL mode -- so it can't disturb the real bus.
+  selftest_period: "1s"    # how often the loopback self-test frame fires (if on)
+
+esphome:
+  name: ${node_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  # 'adafruit_feather_esp32_v2' has historically failed to resolve in ESPHome
+  # (esphome/issues#3357); the generic esp32dev target drives this board fine.
+  board: esp32dev
+  framework:
+    type: arduino
+    advanced:
+      # binary-size / IRAM optimizations flagged in the boot log. Safe for this
+      # exact board (ESP32 rev 3.1). minimum_chip_revision locks the build to
+      # rev >= 3.1; sram1_as_iram frees ~40 KB of IRAM.
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+
+logger:
+  # INFO is enough to read the frame dump below without CAN-driver spam.
+  # Bump to DEBUG if you want the mcp2515 component's own chatter too.
+  level: INFO
+  baud_rate: 115200
+
+# Native HA API -- used ONLY in this phase for bring-up diagnostics, so you can
+# confirm the board is alive in Home Assistant. Phase 2 switches to MQTT.
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback hotspot if home WiFi is unreachable -- handy in the basement.
+  ap:
+    ssid: "HD90-Sniffer Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# --- SPI bus for the MCP2515 -------------------------------------------------
+spi:
+  clk_pin: GPIO5     # SCK
+  mosi_pin: GPIO19   # MO / MOSI
+  miso_pin: GPIO21   # MI / MISO
+
+# --- CAN bus controller ------------------------------------------------------
+canbus:
+  - platform: mcp2515
+    id: hd90_can
+    cs_pin: GPIO14           # MCP2515 chip-select (see header notes)
+    clock: ${mcp_clock}      # crystal on the FeatherWing = 16 MHz
+    bit_rate: ${can_bitrate} # bus speed -- MUST match the HD90's actual rate
+    mode: ${can_mode}        # LOOPBACK (bench) / LISTENONLY (live) / NORMAL.
+                             # See the can_mode notes in substitutions above.
+    # can_id below is only relevant if/when WE transmit. For pure sniffing it
+    # is unused. 11-bit id 0 is a harmless placeholder.
+    can_id: 0
+
+    on_frame:
+      # ------- catch ALL standard (11-bit) frames -------
+      # can_id_mask: 0x000 means "don't care about any id bits" -> match every
+      # frame. This is the standard ESPHome trick for a promiscuous sniffer.
+      - can_id: 0
+        can_id_mask: 0x000
+        use_extended_id: false
+        then:
+          - lambda: |-
+              std::string bytes;
+              char buf[6];
+              for (auto b : x) { sprintf(buf, "%02X ", b); bytes += buf; }
+              ESP_LOGI("hd90.can", "STD id=0x%03X dlc=%u data=[ %s]",
+                       (unsigned) can_id, (unsigned) x.size(), bytes.c_str());
+
+      # ------- also catch ALL extended (29-bit) frames -------
+      # Many appliance/automotive buses use 29-bit ids. We don't yet know which
+      # the HD90 uses, so we log both. Delete whichever proves empty.
+      - can_id: 0
+        can_id_mask: 0x000
+        use_extended_id: true
+        then:
+          - lambda: |-
+              std::string bytes;
+              char buf[6];
+              for (auto b : x) { sprintf(buf, "%02X ", b); bytes += buf; }
+              ESP_LOGI("hd90.can", "EXT id=0x%08X dlc=%u data=[ %s]",
+                       (unsigned) can_id, (unsigned) x.size(), bytes.c_str());
+
+# --- Bench self-test ---------------------------------------------------------
+# Emits a distinctive frame every ${selftest_period}. In LOOPBACK mode the
+# MCP2515 loops it straight back into on_frame, so with NOTHING connected to the
+# HD90 you should see, once per period:
+#     [hd90.can]: STD id=0x7FF dlc=4 data=[ DE AD BE EF ]
+# See that -> the whole SPI/MCP2515/TX/RX chain works. Going live: set
+# can_mode: LISTENONLY (this send becomes a no-op) or just delete this block.
+interval:
+  # --- Poll the HD90 (emulate the remote's request) ---
+  - interval: ${poll_period}
+    then:
+      - if:
+          condition:
+            lambda: 'return ${poll_on};'
+          then:
+            - canbus.send:
+                canbus_id: hd90_can
+                can_id: ${poll_id}
+                use_extended_id: false
+                # All-zero request = benign poll. byte0 = 0x00 (< 128), so it is
+                # NOT a setpoint or power command -- it will not change any HD90
+                # settings, it just asks the unit to report. If all-zeros draws
+                # no reply, try [0x01,0,0,0,0,0,0,0] (tinymicros' remote format).
+                data: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  # --- Loopback bench self-test (off unless selftest_on) ---
+  - interval: ${selftest_period}
+    then:
+      - if:
+          condition:
+            lambda: 'return ${selftest_on};'   # compiled out unless selftest_on
+          then:
+            - canbus.send:
+                canbus_id: hd90_can
+                can_id: 0x7FF      # max standard 11-bit id -- distinctive in logs
+                use_extended_id: false
+                data: [0xDE, 0xAD, 0xBE, 0xEF]
+
+# --- bring-up diagnostics (visible in HA) ------------------------------------
+debug:                        # provides free-heap etc.
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 30s
+  - platform: debug
+    free:
+      name: "Free Heap"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+
+binary_sensor:
+  - platform: status
+    name: "Status"   # ESPHome connectivity, confirms the node is online
+
+# --- Command test rig (temporary; verifies the WRITE side) -------------------
+# Exposed on the local web server so we can fire one-shot commands via curl and
+# watch byte1 (setpoint) / byte4 bit0 (power) echo back in the status frames.
+web_server:
+  port: 80
+
+number:
+  - platform: template
+    name: "Test Setpoint"
+    id: test_setpoint          # web REST: POST /number/test_setpoint/set?value=N
+    optimistic: true
+    min_value: 36
+    max_value: 90
+    step: 1
+    set_action:
+      - canbus.send:
+          canbus_id: hd90_can
+          can_id: 0x123
+          use_extended_id: false
+          # RE setpoint command = [pct + 128, 0, ...]
+          data: !lambda 'return {(uint8_t)((int) x + 128), 0, 0, 0, 0, 0, 0, 0};'
+
+button:
+  - platform: template
+    name: "Power Toggle"
+    id: power_toggle           # web REST: POST /button/power_toggle/press
+    on_press:
+      - canbus.send:
+          canbus_id: hd90_can
+          can_id: 0x123
+          use_extended_id: false
+          # RE power toggle = [0, 0, 0x01, ...]
+          data: [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+  - platform: template
+    name: "Continuous Mode"
+    id: continuous_mode        # web REST: POST /button/continuous_mode/press
+    on_press:
+      - canbus.send:
+          canbus_id: hd90_can
+          can_id: 0x123
+          use_extended_id: false
+          # RE continuous = setpoint 163 (0xA3 = 35 + 128). Exit by sending a
+          # normal setpoint (36-90) via the Test Setpoint number.
+          data: [0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
