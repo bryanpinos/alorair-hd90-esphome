@@ -23,11 +23,11 @@ substitutions:
   friendly_name: "HD90 Dehumidifier"
 
   # --- MQTT transport --------------------------------------------------------
-  mqtt_broker: "192.168.1.10"      # <-- set to your Mosquitto broker IP/hostname.
-                                   # A DHCP reservation for the broker is recommended
-                                   # so this address stays stable. If your broker
-                                   # needs auth, add username/password in the mqtt:
-                                   # block below (this config assumes anonymous).
+  mqtt_broker: !secret mqtt_broker  # set in secrets.yaml (see secrets.yaml.example).
+                                    # Prefer a stable DNS name over a bare IP so the
+                                    # broker can move hosts without reflashing. If your
+                                    # broker needs auth, add username/password in the
+                                    # mqtt: block below (this config assumes anonymous).
 
   # --- CAN link (must match the sniffer's proven settings) -------------------
   can_bitrate: "125KBPS"           # CONFIRMED 125 kbps (verified live on the HD90)
