@@ -250,6 +250,14 @@ binary_sensor:
     device_class: problem      # ON = problem (stale/no CAN data)
 
 text_sensor:
+  # Which AP, not just how loud. Without this the controller shows a blank
+  # access-point cell on the ESP fleet dashboard, and a device silently sitting
+  # on a far AP is exactly the fault that is hard to see (an APC bridge was
+  # stranded on the shed AP at -92 dBm / 1 Mbps before anyone noticed).
+  - platform: wifi_info
+    bssid:
+      name: "WiFi BSSID"
+
   - platform: template
     name: "HD90 Fault Code"
     id: hd90_fault_code
